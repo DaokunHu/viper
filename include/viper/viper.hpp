@@ -650,7 +650,7 @@ ViperInitData init_file_pool(const std::string& pool_dir, uint64_t pool_size,
     } else {
         const size_t meta_map_size = alloc_size;
         void* metadata_addr;
-        id(eSM == 1) {
+        if(eSM == 1) {
           metadata_addr = mmap(nullptr, PAGE_SIZE, VIPER_MAP_PROT, VIPER_MAP_FLAGS, meta_fd, 0);
         }
         else if (eSM == 2) {
