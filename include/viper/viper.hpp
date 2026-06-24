@@ -1,21 +1,23 @@
 #pragma once
 
-#include <iostream>
-#include <bitset>
-#include <fcntl.h>
-#include <unistd.h>
-#include <vector>
-#include <thread>
-#include <cmath>
-#include <linux/mman.h>
-#include <sys/mman.h>
 #include <atomic>
-#include <assert.h>
+#include <bitset>
+#include <cmath>
 #include <filesystem>
-#include <immintrin.h>
+#include <iostream>
+#include <thread>
+#include <vector>
 
 #include "cceh.hpp"
 #include "concurrentqueue.h"
+
+#include <assert.h>
+#include <fcntl.h>
+#include <immintrin.h>
+#include <linux/mman.h>
+#include <numa.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #ifndef NDEBUG
 #define DEBUG_LOG(msg) (std::cout << msg << std::endl)
@@ -27,7 +29,8 @@
  * Define this to use Viper in DRAM instead of PMem. This will allocate all VPages in DRAM.
  */
 //#define VIPER_DRAM
-
+extern int eSM;  // 0:DRAM, 1:PM, 2:CXL
+extern int CXL_NODE;
 namespace viper {
 
 using version_lock_t = uint8_t;
@@ -504,9 +507,9 @@ template <typename K, typename V>
 Viper<K, V>::~Viper() {
     if (owns_pool_) {
         DEBUG_LOG("Closing pool file.");
-        munmap(v_base_.v_metadata, v_base_.v_metadata->block_offset);
+        if (eSM == 1) munmap(v_base_.v_metadata, v_base_.v_metadata->block_offset);
         for (const ViperFileMapping& mapping : v_base_.v_mappings) {
-            munmap(mapping.start_addr, mapping.mapped_size);
+          if (eSM == 1) munmap(mapping.start_addr, mapping.mapped_size);
         }
         close(v_base_.file_descriptor);
     }
@@ -646,7 +649,13 @@ ViperInitData init_file_pool(const std::string& pool_dir, uint64_t pool_size,
         }
     } else {
         const size_t meta_map_size = alloc_size;
-        void *metadata_addr = mmap(nullptr, PAGE_SIZE, VIPER_MAP_PROT, VIPER_MAP_FLAGS, meta_fd, 0);
+        void* metadata_addr;
+        id(eSM == 1) {
+          metadata_addr = mmap(nullptr, PAGE_SIZE, VIPER_MAP_PROT, VIPER_MAP_FLAGS, meta_fd, 0);
+        }
+        else if (eSM == 2) {
+          metadata_addr = numa_alloc_onnode(PAGE_SIZE, CXL_NODE);
+        }
         MMAP_CHECK(metadata_addr)
 
         metadata = static_cast<ViperFileMetadata *>(metadata_addr);
@@ -672,34 +681,47 @@ ViperInitData init_file_pool(const std::string& pool_dir, uint64_t pool_size,
     mappings.reserve(num_alloc_chunks);
 
     for (size_t chunk_num = 0; chunk_num < num_alloc_chunks; ++chunk_num) {
+      void* pmem_addr;
+      if (eSM == 1) {
         std::filesystem::path data_file = pool_dir + "/data" + std::to_string(chunk_num);
         const int data_fd = ::open(data_file.c_str(), VIPER_FILE_OPEN_FLAGS, 0644);
         if (data_fd < 0) {
-            IO_ERROR("Cannot open data file: " + data_file.string());
+          IO_ERROR("Cannot open data file: " + data_file.string());
         }
         if (is_new_pool) {
-            if (fallocate(data_fd, 0, 0, alloc_size) != 0) {
-                IO_ERROR("Could not allocate: " + data_file.string());
-            }
+          if (fallocate(data_fd, 0, 0, alloc_size) != 0) {
+            IO_ERROR("Could not allocate: " + data_file.string());
+          }
         }
 
-        void* pmem_addr = mmap(nullptr, alloc_size, VIPER_MAP_PROT, VIPER_MAP_FLAGS, data_fd, 0);
+        pmem_addr = mmap(nullptr, alloc_size, VIPER_MAP_PROT, VIPER_MAP_FLAGS, data_fd, 0);
+        // ::close(data_fd);
+      } else if (eSM == 2) {
+        pmem_addr = numa_alloc_onnode(alloc_size, CXL_NODE);
+      }
+
         MMAP_CHECK(pmem_addr)
         ViperFileMapping mapping{.mapped_size = alloc_size, .start_addr = (char*) pmem_addr};
         mappings.push_back(mapping);
-        ::close(data_fd);
     }
 
     const size_t num_allocated_blocks = num_alloc_chunks * (alloc_size / block_size);
 
     if (is_new_pool) {
-        void* metadata_addr = mmap(nullptr, alloc_size, VIPER_MAP_PROT, VIPER_MAP_FLAGS, meta_fd, 0);
-        MMAP_CHECK(metadata_addr)
-        ViperFileMetadata v_metadata{ .block_offset = PAGE_SIZE, .block_size = block_size,
-                .alloc_size = alloc_size, .num_used_blocks = 0,
-                .num_allocated_blocks = num_allocated_blocks, .total_mapped_size = pool_size};
-        internal::pmem_memcpy_persist(metadata_addr, &v_metadata, sizeof(v_metadata));
-        metadata = static_cast<ViperFileMetadata*>(metadata_addr);
+      void* metadata_addr;
+      if (eSM == 1)
+        metadata_addr = mmap(nullptr, alloc_size, VIPER_MAP_PROT, VIPER_MAP_FLAGS, meta_fd, 0);
+      else if (eSM == 2)
+        metadata_addr = numa_alloc_onnode(alloc_size, CXL_NODE);
+      MMAP_CHECK(metadata_addr)
+      ViperFileMetadata v_metadata{.block_offset = PAGE_SIZE,
+                                   .block_size = block_size,
+                                   .alloc_size = alloc_size,
+                                   .num_used_blocks = 0,
+                                   .num_allocated_blocks = num_allocated_blocks,
+                                   .total_mapped_size = pool_size};
+      internal::pmem_memcpy_persist(metadata_addr, &v_metadata, sizeof(v_metadata));
+      metadata = static_cast<ViperFileMetadata*>(metadata_addr);
     }
     ::close(meta_fd);
     return ViperInitData{ .fd = -1, .meta = metadata, .mappings = std::move(mappings) };
@@ -752,8 +774,12 @@ ViperFileMapping Viper<K, V>::allocate_v_page_blocks() {
         if (fallocate(data_fd, 0, 0, alloc_size) != 0) {
             IO_ERROR("Could not allocate: " + data_file.string());
         }
-        pmem_addr = mmap(nullptr, alloc_size, VIPER_MAP_PROT, VIPER_MAP_FLAGS, data_fd, 0);
-        ::close(data_fd);
+        if (eSM == 1) {
+          pmem_addr = mmap(nullptr, alloc_size, VIPER_MAP_PROT, VIPER_MAP_FLAGS, data_fd, 0);
+          ::close(data_fd);
+        } else if (eSM == 2) {
+          pmem_addr = numa_alloc_onnode(alloc_size, CXL_NODE);
+        }
     } else {
         const size_t offset = v_base_.v_metadata->total_mapped_size;
         const int fd = v_base_.file_descriptor;
